@@ -1,0 +1,391 @@
+#!/bin/bash
+
+# Project Launcher - A simple tool to manage and launch development projects
+# Version: 1.0.0
+# Author: ShekilRahman
+# License: MIT
+
+CONFIG="$HOME/.pro_config.json"
+LOG_FILE="$HOME/.pro_launcher.log"
+
+# Colors for better visual feedback
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+BLUE='\033[0;34m'
+YELLOW='\033[1;33m'
+NC='\033[0m' # No Color
+
+# Logging function
+function log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> "$LOG_FILE"
+}
+
+# Initialize the config file if it doesn't exist
+function init_config() {
+    if [ ! -f "$CONFIG" ]; then
+        echo "{}" > "$CONFIG"
+        log "Config file initialized at $CONFIG"
+    fi
+}
+
+function print_colored() {
+    echo -e "${1}${2}${NC}"
+}
+
+function list_projects() {
+    jq -r 'keys[]' "$CONFIG" 2>/dev/null
+}
+
+function launch_project() {
+    local proj="$1"
+    local proj_dir
+    local commands
+    
+    proj_dir=$(jq -r --arg p "$proj" '.[$p].dir // empty' "$CONFIG")
+    commands=$(jq -c --arg p "$proj" '.[$p].commands // []' "$CONFIG")
+    
+    if [ -z "$proj_dir" ]; then
+        print_colored $RED "❌ Project '$proj' not found."
+        log "Failed to launch project '$proj': not found"
+        return 1
+    fi
+    
+    if [ ! -d "$proj_dir" ]; then
+        print_colored $RED "❌ Project directory '$proj_dir' does not exist."
+        log "Failed to launch project '$proj': directory '$proj_dir' not found"
+        return 1
+    fi
+    
+    print_colored $GREEN "🚀 Launching '$proj' in $proj_dir"
+    log "Launching project '$proj' in directory '$proj_dir'"
+    
+    # Parse commands array from JSON
+    mapfile -t cmd_array < <(echo "$commands" | jq -r '.[]?')
+    
+    if [ ${#cmd_array[@]} -eq 0 ]; then
+        # No commands - open single terminal window
+        gnome-terminal --title="$proj" -- bash -c "
+            cd \"$proj_dir\" || exit 1
+            echo -e '\033[1;32m🎯 Project: $proj\033[0m'
+            echo -e '\033[1;34m📁 Directory: $proj_dir\033[0m'
+            echo -e '\033[1;33m⚡ Ready to work!\033[0m'
+            echo
+            exec bash
+        "
+        log "Opened terminal for project '$proj' with no commands"
+        return 0
+    fi
+    
+    local temp_dir
+    temp_dir=$(mktemp -d)
+    
+    # Create script files for each command
+    for ((i=0; i<${#cmd_array[@]}; i++)); do
+        local script_file="$temp_dir/cmd_$i.sh"
+        local escaped_dir="${proj_dir//\"/\\\"}"
+        local escaped_cmd="${cmd_array[$i]//\"/\\\"}"
+        
+        cat > "$script_file" <<EOF
+#!/bin/bash
+cd "$escaped_dir" || exit 1
+echo -e "\033[1;32m🎯 Project: $proj\033[0m"
+echo -e "\033[1;34m📁 Directory: $escaped_dir\033[0m"
+echo -e "\033[1;33m➜ Running: $escaped_cmd\033[0m"
+echo
+$escaped_cmd
+echo
+echo -e "\033[1;33m✅ Command completed\033[0m"
+exec bash
+EOF
+        chmod +x "$script_file"
+    done
+    
+    # Open commands as tabs with small delay
+    for ((i=0; i<${#cmd_array[@]}; i++)); do
+        gnome-terminal --tab --title="$proj - $((i+1))" -- bash -c "${temp_dir}/cmd_$i.sh" &
+        sleep 0.5
+        log "Opened terminal tab for command: ${cmd_array[$i]}"
+    done
+    
+    print_colored $GREEN "✅ Project '$proj' launched with ${#cmd_array[@]} command(s)"
+    log "Successfully launched project '$proj' with ${#cmd_array[@]} commands"
+}
+
+function add_project() {
+    echo
+    print_colored $YELLOW "➕ Adding New Project"
+    print_colored $BLUE "════════════════════"
+    
+    read -rp "Enter project name: " pname
+    if [ -z "$pname" ]; then
+        print_colored $RED "❌ Project name cannot be empty."
+        log "Failed to add project: empty name provided"
+        return 1
+    fi
+    
+    if jq -e --arg p "$pname" '.[$p]' "$CONFIG" >/dev/null 2>&1; then
+        print_colored $RED "❌ Project '$pname' already exists."
+        log "Failed to add project '$pname': already exists"
+        return 1
+    fi
+    
+    echo
+    print_colored $YELLOW "📁 Select project directory:"
+    echo "1) Enter full path manually"
+    echo "2) Use current directory ($(pwd))"
+    echo "3) Browse from home directory"
+    
+    read -rp "Choose option (1-3): " dir_option
+    
+    case "$dir_option" in
+        1)
+            read -rp "Enter full path: " pdir
+            ;;
+        2)
+            pdir="$(pwd)"
+            ;;
+        3)
+            echo "Available directories in $HOME:"
+            find "$HOME" -maxdepth 2 -type d -name ".*" -prune -o -type d -print | head -20
+            read -rp "Enter directory path: " pdir
+            ;;
+        *)
+            print_colored $RED "❌ Invalid option."
+            log "Failed to add project '$pname': invalid directory option"
+            return 1
+            ;;
+    esac
+    
+    # Expand ~ to home directory if used
+    pdir="${pdir/#\~/$HOME}"
+    
+    if [ ! -d "$pdir" ]; then
+        print_colored $RED "❌ Directory '$pdir' does not exist."
+        read -rp "Create directory? (y/n): " create_dir
+        if [[ "$create_dir" =~ ^[Yy]$ ]]; then
+            mkdir -p "$pdir" || {
+                print_colored $RED "❌ Failed to create directory."
+                log "Failed to create directory '$pdir' for project '$pname'"
+                return 1
+            }
+            print_colored $GREEN "✅ Directory created."
+            log "Created directory '$pdir' for project '$pname'"
+        else
+            return 1
+        fi
+    fi
+    
+    echo
+    print_colored $YELLOW "⚡ Enter startup commands (one per line):"
+    print_colored $BLUE "Examples: npm start, python app.py, code ., etc."
+    print_colored $BLUE "Press Enter on empty line when done:"
+    
+    cmds=()
+    while true; do
+        read -rp "Command> " c
+        [[ -z "$c" ]] && break
+        cmds+=("$c")
+        print_colored $GREEN "  ✓ Added: $c"
+    done
+    
+    # Convert commands array to JSON
+    cmds_json=$(printf '%s\n' "${cmds[@]}" | jq -R . | jq -s .)
+    
+    # Add to config JSON
+    tmp=$(mktemp)
+    if ! jq --arg p "$pname" --arg d "$pdir" --argjson c "$cmds_json" \
+       '. + {($p): {dir: $d, commands: $c}}' "$CONFIG" > "$tmp"; then
+        print_colored $RED "❌ Failed to update configuration."
+        log "Failed to update config for project '$pname'"
+        return 1
+    fi
+    
+    mv "$tmp" "$CONFIG"
+    print_colored $GREEN "✅ Project '$pname' added successfully!"
+    log "Added project '$pname' with ${#cmds[@]} commands"
+    echo "   📁 Directory: $pdir"
+    echo "   ⚡ Commands: ${#cmds[@]}"
+}
+
+function delete_project() {
+    echo
+    print_colored $YELLOW "🗑️  Delete Project"
+    print_colored $BLUE "═══════════════"
+    
+    if [ "$(jq 'length' "$CONFIG")" -eq 0 ]; then
+        print_colored $RED "❌ No projects found."
+        log "No projects found for deletion"
+        return 1
+    fi
+    
+    echo "Available projects:"
+    list_projects | nl -w2 -s') '
+    echo
+    
+    read -rp "Enter project name to delete: " pname
+    
+    if [ -z "$pname" ]; then
+        print_colored $RED "❌ Project name cannot be empty."
+        log "Empty project name provided for deletion"
+        return 1
+    fi
+    
+    if ! jq -e --arg p "$pname" '.[$p]' "$CONFIG" >/dev/null 2>&1; then
+        print_colored $RED "❌ Project '$pname' not found."
+        log "Project '$pname' not found for deletion"
+        return 1
+    fi
+    
+    # Show project details before deletion
+    proj_dir=$(jq -r --arg p "$pname" '.[$p].dir' "$CONFIG")
+    proj_cmds=$(jq -r --arg p "$pname" '.[$p].commands | length' "$CONFIG")
+    
+    echo
+    print_colored $YELLOW "Project details:"
+    echo "  Name: $pname"
+    echo "  Directory: $proj_dir"
+    echo "  Commands: $proj_cmds"
+    echo
+    
+    read -rp "Are you sure you want to delete this project? (y/N): " confirm
+    
+    if [[ "$confirm" =~ ^[Yy]$ ]]; then
+        tmp=$(mktemp)
+        if ! jq --arg p "$pname" 'del(.[$p])' "$CONFIG" > "$tmp"; then
+            print_colored $RED "❌ Failed to delete project."
+            log "Failed to delete project '$pname' from config"
+            return 1
+        fi
+        mv "$tmp" "$CONFIG"
+        print_colored $GREEN "✅ Project '$pname' deleted successfully!"
+        log "Deleted project '$pname'"
+    else
+        print_colored $BLUE "ℹ️  Deletion cancelled."
+        log "Cancelled deletion of project '$pname'"
+    fi
+}
+
+function show_projects() {
+    echo
+    print_colored $YELLOW "📋 All Projects"
+    print_colored $BLUE "═══════════════"
+    
+    if [ "$(jq 'length' "$CONFIG")" -eq 0 ]; then
+        print_colored $RED "❌ No projects found."
+        return 0
+    fi
+    
+    # Display projects with details
+    while IFS= read -r project; do
+        if [ -n "$project" ]; then
+            proj_dir=$(jq -r --arg p "$project" '.[$p].dir' "$CONFIG")
+            proj_cmds=$(jq -r --arg p "$project" '.[$p].commands | length' "$CONFIG")
+            
+            print_colored $GREEN "🎯 $project"
+            echo "   📁 $proj_dir"
+            echo "   ⚡ $proj_cmds command(s)"
+            
+            # Show commands if any
+            if [ "$proj_cmds" -gt 0 ]; then
+                echo "   Commands:"
+                jq -r --arg p "$project" '.[$p].commands[]' "$CONFIG" | sed 's/^/     • /'
+            fi
+            echo
+        fi
+    done < <(list_projects)
+    log "Displayed list of projects"
+}
+
+function show_help() {
+    echo
+    print_colored $YELLOW "Project Launcher Help"
+    print_colored $BLUE "════════════════════"
+    echo "Usage: pro [command] [project_name]"
+    echo
+    echo "Commands:"
+    echo "  launch <project>  Launch a project (default command)"
+    echo "  add               Add a new project"
+    echo "  list              List all projects"
+    echo "  show              Show detailed project information"
+    echo "  delete            Delete a project"
+    echo "  help              Show this help message"
+    echo
+    echo "Examples:"
+    echo "  pro launch my-project  # Launch 'my-project'"
+    echo "  pro add                # Add a new project"
+    echo "  pro list               # List all projects"
+    echo
+}
+
+function main() {
+    init_config
+    
+    if [ "$#" -gt 0 ]; then
+        case "$1" in
+            add) add_project ;;
+            list) list_projects ;;
+            show) show_projects ;;
+            delete|del|rm) delete_project ;;
+            help|--help|-h) show_help ;;
+            launch|start|run)
+                if [ -n "$2" ]; then
+                    launch_project "$2"
+                else
+                    print_colored $RED "❌ Please specify a project name."
+                    show_help
+                fi
+                ;;
+            *)
+                # Assume argument is project name to launch
+                launch_project "$1" ;;
+        esac
+    else
+        # Interactive mode
+        while true; do
+            clear
+            print_colored $YELLOW "Project Launcher - Interactive Mode"
+            echo
+            print_colored $BLUE "Available commands:"
+            echo "1) launch <project>  - Launch a project"
+            echo "2) add               - Add a new project"
+            echo "3) list              - List all projects"
+            echo "4) show              - Show detailed project info"
+            echo "5) delete            - Delete a project"
+            echo "6) help              - Show help"
+            echo "7) exit              - Exit the program"
+            echo
+            
+            read -rp "Enter command: " cmd args
+            
+            case $cmd in
+                launch|1)
+                    if [ -n "$args" ]; then
+                        launch_project "$args"
+                    else
+                        print_colored $RED "❌ Please specify a project name."
+                    fi
+                    ;;
+                add|2) add_project ;;
+                list|3) list_projects ;;
+                show|4) show_projects ;;
+                delete|del|rm|5) delete_project ;;
+                help|6) show_help ;;
+                exit|7)
+                    print_colored $GREEN "👋 Goodbye!"
+                    exit 0
+                    ;;
+                *)
+                    print_colored $RED "❌ Unknown command. Type 'help' for available commands."
+                    ;;
+            esac
+            
+            echo
+            read -rp "Press Enter to continue..."
+        done
+    fi
+}
+
+# Handle Ctrl+C gracefully
+trap 'echo; print_colored $YELLOW "👋 Goodbye!"; exit 0' INT
+
+main "$@"
